@@ -1,0 +1,429 @@
+SuperBizAgent Java 文件调用关系分析
+=====================================
+
+生成时间: 2026-05-05
+项目结构: Spring Boot + AI Agent + RAG + Milvus
+
+一、整体架构分层
+================
+
+1. 入口层 (Entry Point)
+   - Main.java
+
+2. 控制器层 (Controller Layer)
+   - ChatController.java
+   - FileUploadController.java
+   - MilvusCheckController.java
+
+3. 服务层 (Service Layer)
+   - ChatService.java
+   - AiOpsService.java
+   - RagService.java
+   - VectorIndexService.java
+   - VectorSearchService.java
+   - VectorEmbeddingService.java
+   - DocumentChunkService.java
+
+4. 工具层 (Tool Layer - Agent Tools)
+   - DateTimeTools.java
+   - InternalDocsTools.java
+   - QueryLogsTools.java
+   - QueryMetricsTools.java
+
+5. 配置层 (Configuration Layer)
+   - MilvusConfig.java
+   - WebConfig.java
+   - DashScopeConfig.java
+   - DocumentChunkConfig.java
+   - FileUploadConfig.java
+   - MilvusProperties.java
+   - WebMvcConfig.java
+
+6. 客户端层 (Client Layer)
+   - MilvusClientFactory.java
+
+7. DTO/常量层 (DTO & Constants)
+   - DocumentChunk.java
+   - FileUploadRes.java
+   - AIOpsRequest.java
+   - MilvusConstants.java
+
+
+二、详细调用关系
+================
+
+【1】启动流程
+-------------
+Main.java
+  └─> SpringApplication.run()
+       └─> 自动扫描并加载所有 @Component, @Service, @Controller, @Configuration
+
+
+【2】对话功能调用链 (Chat Flow)
+-------------------------------
+
+2.1 普通对话接口 (/api/chat)
+ChatController.chat()
+  ├─> getOrCreateSession() [内部方法]
+  ├─> SessionInfo.getHistory() [内部类]
+  ├─> ChatService.createDashScopeApi()
+  ├─> ChatService.createStandardChatModel()
+  │    └─> ChatService.createChatModel()
+  ├─> ChatService.logAvailableTools()
+  │    └─> ToolCallbackProvider.getToolCallbacks()
+  ├─> ChatService.buildSystemPrompt()
+  ├─> ChatService.createReactAgent()
+  │    ├─> ChatService.buildMethodToolsArray()
+  │    │    └─> 返回: [DateTimeTools, InternalDocsTools, QueryMetricsTools, QueryLogsTools?]
+  │    ├─> ChatService.getToolCallbacks()
+  │    └─> ReactAgent.builder().build()
+  └─> ChatService.executeChat()
+       └─> ReactAgent.call()
+            └─> [自动调用工具]:
+                 ├─> DateTimeTools.getCurrentDateTime()
+                 ├─> InternalDocsTools.queryInternalDocs()
+                 │    └─> VectorSearchService.searchSimilarDocuments()
+                 │         ├─> VectorEmbeddingService.generateQueryVector()
+                 │         │    └─> VectorEmbeddingService.generateEmbedding()
+                 │         │         └─> DashScope TextEmbedding API
+                 │         └─> MilvusServiceClient.search()
+                 ├─> QueryMetricsTools.queryPrometheusAlerts()
+                 │    └─> OkHttpClient HTTP请求 → Prometheus API
+                 └─> QueryLogsTools.queryLogs() [Mock模式]
+                      └─> 返回模拟日志数据
+
+2.2 流式对话接口 (/api/chat_stream)
+ChatController.chatStream()
+  ├─> getOrCreateSession()
+  ├─> ChatService.createDashScopeApi()
+  ├─> ChatService.createStandardChatModel()
+  ├─> ChatService.logAvailableTools()
+  ├─> ChatService.buildSystemPrompt()
+  ├─> ChatService.createReactAgent()
+  └─> ReactAgent.stream()
+       └─> Flux.subscribe()
+            ├─> 处理 StreamingOutput.AGENT_MODEL_STREAMING
+            ├─> 处理 StreamingOutput.AGENT_MODEL_FINISHED
+            ├─> 处理 StreamingOutput.AGENT_TOOL_FINISHED
+            └─> SessionInfo.addMessage() [更新会话历史]
+
+
+【3】AI运维功能调用链 (AIOps Flow)
+----------------------------------
+
+ChatController.aiOps()
+  ├─> ChatService.createDashScopeApi()
+  ├─> DashScopeChatModel.builder().build()
+  ├─> ToolCallbackProvider.getToolCallbacks()
+  └─> AiOpsService.executeAiOpsAnalysis()
+       ├─> AiOpsService.buildPlannerAgent()
+       │    ├─> AiOpsService.buildMethodToolsArray()
+       │    │    └─> 返回: [DateTimeTools, InternalDocsTools, QueryMetricsTools, QueryLogsTools?]
+       │    └─> ReactAgent.builder().build()
+       ├─> AiOpsService.buildExecutorAgent()
+       │    ├─> AiOpsService.buildMethodToolsArray()
+       │    └─> ReactAgent.builder().build()
+       └─> SupervisorAgent.builder().build()
+            └─> SupervisorAgent.invoke()
+                 └─> [多Agent协作循环]:
+                      ├─> PlannerAgent (规划步骤)
+                      │    └─> 调用工具:
+                      │         ├─> DateTimeTools.getCurrentDateTime()
+                      │         ├─> InternalDocsTools.queryInternalDocs()
+                      │         │    └─> VectorSearchService.searchSimilarDocuments()
+                      │         ├─> QueryMetricsTools.queryPrometheusAlerts()
+                      │         └─> QueryLogsTools.queryLogs()
+                      ├─> ExecutorAgent (执行步骤)
+                      │    └─> 调用相同工具集
+                      └─> SupervisorAgent (调度决策)
+                           └─> 直到 decision=FINISH
+
+ChatController.aiOps() [后续处理]
+  └─> AiOpsService.extractFinalReport()
+       └─> state.value("planner_plan")
+            └─> 提取 AssistantMessage.getText()
+
+
+【4】文件上传与向量索引调用链 (File Upload & Indexing Flow)
+----------------------------------------------------------
+
+FileUploadController.upload()
+  ├─> FileUploadConfig.getPath() [配置注入]
+  ├─> FileUploadConfig.getAllowedExtensions()
+  ├─> Files.copy() [保存文件到 uploads/]
+  └─> VectorIndexService.indexSingleFile()
+       ├─> Files.readString() [读取文件内容]
+       ├─> VectorIndexService.deleteExistingData()
+       │    └─> MilvusServiceClient.loadCollection()
+       │    └─> MilvusServiceClient.delete() [删除旧数据]
+       ├─> DocumentChunkService.chunkDocument()
+       │    ├─> DocumentChunkService.splitByHeadings() [按标题分割]
+       │    ├─> DocumentChunkService.chunkSection() [分片处理]
+       │    │    ├─> DocumentChunkService.splitByParagraphs() [按段落分割]
+       │    │    └─> DocumentChunkService.getOverlapText() [重叠文本]
+       │    └─> 返回 List<DocumentChunk>
+       └─> [对每个分片]:
+            ├─> VectorEmbeddingService.generateEmbedding()
+            │    └─> DashScope TextEmbedding API
+            ├─> VectorIndexService.buildMetadata() [构建元数据]
+            └─> VectorIndexService.insertToMilvus()
+                 ├─> MilvusServiceClient.loadCollection()
+                 └─> MilvusServiceClient.insert() [插入向量数据]
+
+
+【5】RAG检索增强生成调用链 (RAG Flow)
+-------------------------------------
+
+RagService.queryStream()
+  ├─> VectorSearchService.searchSimilarDocuments()
+  │    ├─> VectorEmbeddingService.generateQueryVector()
+  │    │    └─> VectorEmbeddingService.generateEmbedding()
+  │    │         └─> DashScope TextEmbedding API
+  │    └─> MilvusServiceClient.search()
+  ├─> RagService.buildContext() [构建上下文]
+  ├─> RagService.buildPrompt() [构建提示词]
+  └─> RagService.generateAnswerStream()
+       └─> DashScope Generation.streamCall()
+            └─> Flowable.blockingForEach() [流式接收AI响应]
+                 └─> StreamCallback.onContentChunk() [回调前端]
+
+
+【6】向量搜索服务调用链 (Vector Search Flow)
+--------------------------------------------
+
+VectorSearchService.searchSimilarDocuments()
+  ├─> VectorEmbeddingService.generateQueryVector()
+  │    └─> VectorEmbeddingService.generateEmbedding()
+  │         ├─> Constants.apiKey 设置
+  │         ├─> TextEmbeddingParam.builder().build()
+  │         └─> TextEmbedding.call() → DashScope API
+  └─> MilvusServiceClient.search()
+       ├─> SearchParam.newBuilder().build()
+       └─> SearchResultsWrapper 解析结果
+
+
+【7】工具类详细说明 (Tools Detail)
+----------------------------------
+
+7.1 DateTimeTools
+   - getCurrentDateTime(): 获取当前时区时间
+   - 被 ReactAgent 自动调用
+
+7.2 InternalDocsTools
+   - queryInternalDocs(query): 查询内部文档知识库
+   - 依赖: VectorSearchService
+   - 调用链: 
+        InternalDocsTools.queryInternalDocs()
+          └─> VectorSearchService.searchSimilarDocuments()
+               ├─> VectorEmbeddingService.generateQueryVector()
+               └─> MilvusServiceClient.search()
+
+7.3 QueryMetricsTools
+   - queryPrometheusAlerts(): 查询Prometheus活动告警
+   - 支持 Mock 模式和真实模式
+   - Mock模式: 返回预定义的告警数据
+   - 真实模式: OkHttpClient → Prometheus API
+
+7.4 QueryLogsTools
+   - getAvailableLogTopics(): 获取可用日志主题列表
+   - queryLogs(region, logTopic, query, limit): 查询日志
+   - 支持 Mock 模式和真实模式
+   - Mock模式: 根据告警类型返回关联的模拟日志
+   - 真实模式: 预留CLS API接口（未实现）
+
+
+【8】配置类依赖关系 (Configuration Dependencies)
+------------------------------------------------
+
+8.1 MilvusConfig
+   └─> MilvusClientFactory.createClient()
+        └─> 创建 MilvusServiceClient Bean
+
+8.2 WebConfig
+   └─> 配置 UTF-8 编码转换器
+   └─> ObjectMapper Bean
+
+8.3 DashScopeConfig (假设存在)
+   └─> 配置 DashScope API Key
+
+8.4 DocumentChunkConfig
+   └─> 配置分片大小、重叠长度等参数
+
+8.5 FileUploadConfig
+   └─> 配置上传路径、允许的文件扩展名
+
+
+【9】数据流转图 (Data Flow Diagram)
+-----------------------------------
+
+用户请求
+  │
+  ├─> /api/chat 或 /api/chat_stream
+  │     │
+  │     ├─> ChatController
+  │     │    └─> ChatService
+  │     │         └─> ReactAgent
+  │     │              ├─> 工具调用 (Tools)
+  │     │              │    ├─> DateTimeTools
+  │     │              │    ├─> InternalDocsTools → VectorSearch → Milvus
+  │     │              │    ├─> QueryMetricsTools → Prometheus API
+  │     │              │    └─> QueryLogsTools → Mock/CLS
+  │     │              └─> DashScope ChatModel → AI响应
+  │     │
+  │     └─> 返回答案 (JSON/SSE)
+  │
+  ├─> /api/ai_ops
+  │     │
+  │     ├─> ChatController
+  │     │    └─> AiOpsService
+  │     │         ├─> SupervisorAgent
+  │     │         │    ├─> PlannerAgent
+  │     │         │    │    └─> 工具调用 (同上)
+  │     │         │    └─> ExecutorAgent
+  │     │         │         └─> 工具调用 (同上)
+  │     │         └─> 提取最终报告
+  │     │
+  │     └─> 返回告警分析报告 (SSE)
+  │
+  └─> /api/upload
+        │
+        ├─> FileUploadController
+        │    └─> VectorIndexService
+        │         ├─> DocumentChunkService [分片]
+        │         ├─> VectorEmbeddingService [向量化]
+        │         └─> MilvusServiceClient [存储]
+        │
+        └─> 返回上传结果 (JSON)
+
+
+【10】核心依赖注入关系 (Dependency Injection)
+----------------------------------------------
+
+ChatController
+  ├─> @Autowired AiOpsService
+  ├─> @Autowired ChatService
+  └─> @Autowired ToolCallbackProvider
+
+ChatService
+  ├─> @Autowired InternalDocsTools
+  ├─> @Autowired DateTimeTools
+  ├─> @Autowired QueryMetricsTools
+  ├─> @Autowired QueryLogsTools (optional)
+  └─> @Autowired ToolCallbackProvider
+
+AiOpsService
+  ├─> @Autowired DateTimeTools
+  ├─> @Autowired InternalDocsTools
+  ├─> @Autowired QueryMetricsTools
+  └─> @Autowired QueryLogsTools (optional)
+
+InternalDocsTools
+  └─> @Autowired VectorSearchService
+
+VectorIndexService
+  ├─> @Autowired MilvusServiceClient
+  ├─> @Autowired VectorEmbeddingService
+  └─> @Autowired DocumentChunkService
+
+VectorSearchService
+  ├─> @Autowired MilvusServiceClient
+  └─> @Autowired VectorEmbeddingService
+
+MilvusConfig
+  └─> @Autowired MilvusClientFactory
+
+FileUploadController
+  ├─> @Autowired FileUploadConfig
+  └─> @Autowired VectorIndexService
+
+
+【11】关键设计模式 (Design Patterns)
+------------------------------------
+
+1. 依赖注入 (Dependency Injection)
+   - Spring框架通过@Autowired实现松耦合
+
+2. 工厂模式 (Factory Pattern)
+   - MilvusClientFactory 创建 MilvusServiceClient
+
+3. 单例模式 (Singleton Pattern)
+   - @Service, @Component 默认单例
+
+4. 策略模式 (Strategy Pattern)
+   - Mock模式 vs 真实模式的切换
+   - QueryMetricsTools, QueryLogsTools 根据配置选择不同策略
+
+5. 观察者模式 (Observer Pattern)
+   - SSE流式输出: SseEmitter.send() 逐步推送数据
+   - RagService.StreamCallback 回调接口
+
+6. 模板方法模式 (Template Method)
+   - ReactAgent 统一调用流程: build → call/stream → 自动工具调用
+
+7. 代理模式 (Proxy Pattern)
+   - ToolCallbackProvider 代理所有工具调用
+
+
+【12】线程安全与并发 (Concurrency)
+----------------------------------
+
+ChatController
+  ├─> ExecutorService executor = Executors.newCachedThreadPool()
+  │    └─> 异步处理SSE流式请求
+  │
+  └─> SessionInfo (内部类)
+       ├─> ReentrantLock lock [线程锁]
+       ├─> addMessage() [加锁保护]
+       ├─> getHistory() [返回副本]
+       └─> clearHistory() [加锁保护]
+
+
+【13】异常处理策略 (Exception Handling)
+---------------------------------------
+
+1. Controller层
+   - try-catch捕获所有异常
+   - 返回统一ApiResponse格式
+
+2. Service层
+   - 抛出RuntimeException或自定义异常
+   - 记录详细错误日志
+
+3. Tool层
+   - 捕获异常后返回JSON错误信息
+   - 不中断Agent执行流程
+
+
+【14】配置文件依赖 (Configuration Properties)
+----------------------------------------------
+
+application.yml 中的关键配置:
+  ├─> spring.ai.dashscope.api-key [DashScope API密钥]
+  ├─> dashscope.embedding.model [嵌入模型名称]
+  ├─> rag.top-k [RAG检索数量]
+  ├─> rag.model [RAG生成模型]
+  ├─> prometheus.base-url [Prometheus地址]
+  ├─> prometheus.mock-enabled [是否启用Mock]
+  ├─> cls.mock-enabled [是否启用日志Mock]
+  ├─> file.upload.path [文件上传路径]
+  ├─> milvus.host, milvus.port [Milvus连接信息]
+  └─> document.chunk.max-size, overlap [分片配置]
+
+
+三、总结
+========
+
+本项目采用典型的三层架构：
+- Controller层: 接收HTTP请求，参数校验，响应封装
+- Service层: 业务逻辑处理，事务管理
+- Tool层: Agent可调用的具体工具实现
+
+核心特性：
+1. ReactAgent智能体: 自动规划→执行→再规划的闭环
+2. RAG检索增强: 向量检索 + LLM生成
+3. 多Agent协作: Supervisor调度Planner和Executor
+4. 向量数据库: Milvus存储和检索文档向量
+5. 流式输出: SSE实时推送AI响应
+6. Mock支持: 开发测试阶段使用模拟数据
+
+调用链路清晰，职责分明，便于维护和扩展。

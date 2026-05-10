@@ -1,0 +1,1574 @@
+RAG文件上传与检索模块 - 手写实现规划
+======================================
+
+生成时间: 2026-05-05
+目标: 独立实现RAG核心功能（不依赖Spring AI框架）
+
+
+一、模块架构设计
+================
+
+rag-module/
+├── controller/
+│   └── RagController.java              # REST API控制器
+├── service/
+│   ├── FileUploadService.java          # 文件上传服务
+│   ├── DocumentChunkService.java       # 文档分片服务
+│   ├── EmbeddingService.java           # 向量嵌入服务
+│   ├── VectorStoreService.java         # 向量存储服务
+│   └── RetrievalService.java           # 检索服务
+├── model/
+│   ├── DocumentChunk.java              # 文档分片模型
+│   ├── SearchResult.java               # 搜索结果模型
+│   └── UploadResult.java               # 上传结果模型
+├── config/
+│   ├── RagConfig.java                  # RAG配置类
+│   └── MilvusConfig.java               # Milvus配置类
+├── client/
+│   ├── DashScopeClient.java            # DashScope API客户端
+│   └── MilvusClient.java               # Milvus客户端封装
+├── util/
+│   ├── TextProcessor.java              # 文本处理工具
+│   └── JsonUtils.java                  # JSON工具类
+└── exception/
+    ├── RagException.java               # RAG异常基类
+    └── EmbeddingException.java         # 向量生成异常
+
+
+二、核心流程设计
+================
+
+【流程1】文件上传与索引
+-----------------------
+用户上传文件 
+  → RagController.upload()
+  → FileUploadService.saveFile()
+  → DocumentChunkService.chunkDocument()
+     → 按标题分割
+     → 按段落分割
+     → 添加重叠
+  → [对每个分片]
+     → EmbeddingService.generateEmbedding()
+        → 调用DashScope API
+     → VectorStoreService.storeVector()
+        → 存储到Milvus
+  → 返回上传结果
+
+【流程2】语义检索
+-----------------
+用户提问
+  → RagController.search()
+  → RetrievalService.searchSimilarDocuments()
+     → EmbeddingService.generateQueryVector()
+        → 问题文本向量化
+     → VectorStoreService.searchVectors()
+        → Milvus相似度搜索
+     → 返回TopK结果（含相似度分数）
+  → 构建上下文
+  → 返回检索结果
+
+
+三、详细实现规划
+================
+
+【1】数据模型层 (model/)
+------------------------
+
+1.1 DocumentChunk.java
+```java
+package com.example.rag.model;
+
+import lombok.Data;
+
+@Data
+public class DocumentChunk {
+    private String id;              // 分片ID（UUID）
+    private String content;         // 分片内容
+    private String sourceFile;      // 源文件路径
+    private int chunkIndex;         // 分片序号
+    private String title;           // 分片标题
+    private long createdAt;         // 创建时间戳
+    
+    public DocumentChunk(String content, String sourceFile, int chunkIndex) {
+        this.content = content;
+        this.sourceFile = sourceFile;
+        this.chunkIndex = chunkIndex;
+        this.id = java.util.UUID.randomUUID().toString();
+        this.createdAt = System.currentTimeMillis();
+    }
+}
+```
+
+1.2 SearchResult.java
+```java
+package com.example.rag.model;
+
+import lombok.Data;
+import java.util.Map;
+
+@Data
+public class SearchResult {
+    private String id;              // 分片ID
+    private String content;         // 分片内容
+    private float score;            // 相似度分数（越小越相似）
+    private String sourceFile;      // 源文件
+    private Map<String, Object> metadata; // 元数据
+    
+    public SearchResult(String id, String content, float score, 
+                       String sourceFile, Map<String, Object> metadata) {
+        this.id = id;
+        this.content = content;
+        this.score = score;
+        this.sourceFile = sourceFile;
+        this.metadata = metadata;
+    }
+}
+```
+
+1.3 UploadResult.java
+```java
+package com.example.rag.model;
+
+import lombok.Data;
+import java.util.List;
+
+@Data
+public class UploadResult {
+    private boolean success;
+    private String fileName;
+    private String filePath;
+    private long fileSize;
+    private int chunkCount;         // 分片数量
+    private List<String> errors;    // 错误列表
+    
+    public static UploadResult success(String fileName, String filePath, 
+                                      long fileSize, int chunkCount) {
+        UploadResult result = new UploadResult();
+        result.setSuccess(true);
+        result.setFileName(fileName);
+        result.setFilePath(filePath);
+        result.setFileSize(fileSize);
+        result.setChunkCount(chunkCount);
+        return result;
+    }
+    
+    public static UploadResult failure(String fileName, List<String> errors) {
+        UploadResult result = new UploadResult();
+        result.setSuccess(false);
+        result.setFileName(fileName);
+        result.setErrors(errors);
+        return result;
+    }
+}
+```
+
+
+【2】配置层 (config/)
+---------------------
+
+2.1 RagConfig.java
+```java
+package com.example.rag.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConfigurationProperties(prefix = "rag")
+public class RagConfig {
+    
+    // DashScope配置
+    private String apiKey = "";
+    private String embeddingModel = "text-embedding-v2";
+    
+    // 分片配置
+    private int chunkMaxSize = 800;      // 最大分片大小（字符）
+    private int chunkOverlap = 100;      // 重叠大小（字符）
+    
+    // 检索配置
+    private int topK = 3;                // 返回TopK结果
+    private float similarityThreshold = 0.8f; // 相似度阈值
+    
+    // 文件上传配置
+    private String uploadDir = "./uploads";
+    private String allowedExtensions = "txt,md,pdf";
+    
+    // Getters and Setters
+    public String getApiKey() { return apiKey; }
+    public void setApiKey(String apiKey) { this.apiKey = apiKey; }
+    
+    public String getEmbeddingModel() { return embeddingModel; }
+    public void setEmbeddingModel(String embeddingModel) { 
+        this.embeddingModel = embeddingModel; 
+    }
+    
+    public int getChunkMaxSize() { return chunkMaxSize; }
+    public void setChunkMaxSize(int chunkMaxSize) { 
+        this.chunkMaxSize = chunkMaxSize; 
+    }
+    
+    public int getChunkOverlap() { return chunkOverlap; }
+    public void setChunkOverlap(int chunkOverlap) { 
+        this.chunkOverlap = chunkOverlap; 
+    }
+    
+    public int getTopK() { return topK; }
+    public void setTopK(int topK) { this.topK = topK; }
+    
+    public float getSimilarityThreshold() { return similarityThreshold; }
+    public void setSimilarityThreshold(float similarityThreshold) { 
+        this.similarityThreshold = similarityThreshold; 
+    }
+    
+    public String getUploadDir() { return uploadDir; }
+    public void setUploadDir(String uploadDir) { this.uploadDir = uploadDir; }
+    
+    public String getAllowedExtensions() { return allowedExtensions; }
+    public void setAllowedExtensions(String allowedExtensions) { 
+        this.allowedExtensions = allowedExtensions; 
+    }
+}
+```
+
+2.2 MilvusConfig.java
+```java
+package com.example.rag.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConfigurationProperties(prefix = "milvus")
+public class MilvusConfig {
+    
+    private String host = "localhost";
+    private int port = 19530;
+    private String collectionName = "rag_docs";
+    private int vectorDimension = 1024;  // 豆包模型维度
+    private String indexType = "IVF_FLAT";
+    private String metricType = "L2";
+    private int nlist = 128;
+    
+    // Getters and Setters
+    public String getHost() { return host; }
+    public void setHost(String host) { this.host = host; }
+    
+    public int getPort() { return port; }
+    public void setPort(int port) { this.port = port; }
+    
+    public String getCollectionName() { return collectionName; }
+    public void setCollectionName(String collectionName) { 
+        this.collectionName = collectionName; 
+    }
+    
+    public int getVectorDimension() { return vectorDimension; }
+    public void setVectorDimension(int vectorDimension) { 
+        this.vectorDimension = vectorDimension; 
+    }
+    
+    public String getIndexType() { return indexType; }
+    public void setIndexType(String indexType) { this.indexType = indexType; }
+    
+    public String getMetricType() { return metricType; }
+    public void setMetricType(String metricType) { 
+        this.metricType = metricType; 
+    }
+    
+    public int getNlist() { return nlist; }
+    public void setNlist(int nlist) { this.nlist = nlist; }
+    
+    public String getAddress() {
+        return host + ":" + port;
+    }
+}
+```
+
+
+【3】客户端层 (client/)
+-----------------------
+
+3.1 DashScopeClient.java
+```java
+package com.example.rag.client;
+
+import com.example.rag.config.RagConfig;
+import com.example.rag.exception.EmbeddingException;
+import okhttp3.*;
+import com.google.gson.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+@Component
+public class DashScopeClient {
+    
+    private static final Logger logger = LoggerFactory.getLogger(DashScopeClient.class);
+    private static final String BASE_URL = "https://dashscope.aliyuncs.com/api/v1";
+    private static final String EMBEDDING_ENDPOINT = "/services/embeddings/text-embedding/text-embedding";
+    
+    private final RagConfig ragConfig;
+    private OkHttpClient httpClient;
+    private Gson gson;
+    
+    public DashScopeClient(RagConfig ragConfig) {
+        this.ragConfig = ragConfig;
+    }
+    
+    @PostConstruct
+    public void init() {
+        this.httpClient = new OkHttpClient.Builder()
+                .connectTimeout(java.time.Duration.ofSeconds(30))
+                .readTimeout(java.time.Duration.ofSeconds(30))
+                .build();
+        this.gson = new Gson();
+        
+        if (ragConfig.getApiKey() == null || ragConfig.getApiKey().isEmpty()) {
+            throw new IllegalStateException("DashScope API Key未配置");
+        }
+        
+        logger.info("DashScope客户端初始化完成，模型: {}", ragConfig.getEmbeddingModel());
+    }
+    
+    /**
+     * 生成单个文本的向量嵌入
+     */
+    public List<Float> generateEmbedding(String text) throws EmbeddingException {
+        if (text == null || text.trim().isEmpty()) {
+            throw new EmbeddingException("文本内容不能为空");
+        }
+        
+        try {
+            // 构建请求体
+            JsonObject requestBody = new JsonObject();
+            requestBody.addProperty("model", ragConfig.getEmbeddingModel());
+            
+            JsonArray inputArray = new JsonArray();
+            JsonObject inputObj = new JsonObject();
+            inputObj.addProperty("text", text);
+            inputArray.add(inputObj);
+            requestBody.add("input", inputArray);
+            
+            // 发送HTTP请求
+            RequestBody body = RequestBody.create(
+                    gson.toJson(requestBody),
+                    MediaType.parse("application/json")
+            );
+            
+            Request request = new Request.Builder()
+                    .url(BASE_URL + EMBEDDING_ENDPOINT)
+                    .post(body)
+                    .addHeader("Authorization", "Bearer " + ragConfig.getApiKey())
+                    .addHeader("Content-Type", "application/json")
+                    .build();
+            
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (!response.isSuccessful()) {
+                    throw new EmbeddingException("API请求失败: " + response.code());
+                }
+                
+                String responseBody = response.body().string();
+                return parseEmbeddingResponse(responseBody);
+            }
+            
+        } catch (IOException e) {
+            logger.error("调用DashScope API失败", e);
+            throw new EmbeddingException("向量生成失败: " + e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * 批量生成向量嵌入
+     */
+    public List<List<Float>> generateBatchEmbeddings(List<String> texts) 
+            throws EmbeddingException {
+        if (texts == null || texts.isEmpty()) {
+            return Collections.emptyList();
+        }
+        
+        List<List<Float>> embeddings = new ArrayList<>();
+        for (String text : texts) {
+            embeddings.add(generateEmbedding(text));
+        }
+        return embeddings;
+    }
+    
+    /**
+     * 解析API响应
+     */
+    private List<Float> parseEmbeddingResponse(String jsonResponse) 
+            throws EmbeddingException {
+        try {
+            JsonObject json = gson.fromJson(jsonResponse, JsonObject.class);
+            
+            // 检查是否有错误
+            if (json.has("code") && json.get("code").getAsInt() != 0) {
+                String message = json.has("message") ? 
+                        json.get("message").getAsString() : "未知错误";
+                throw new EmbeddingException("API返回错误: " + message);
+            }
+            
+            // 提取向量
+            JsonObject output = json.getAsJsonObject("output");
+            JsonArray embeddings = output.getAsJsonArray("embeddings");
+            
+            if (embeddings.isEmpty()) {
+                throw new EmbeddingException("API返回空向量");
+            }
+            
+            // 获取第一个文本的向量
+            JsonObject firstEmbedding = embeddings.get(0).getAsJsonObject();
+            JsonArray vectorArray = firstEmbedding.getAsJsonArray("embedding");
+            
+            // 转换为List<Float>
+            List<Float> vector = new ArrayList<>();
+            for (JsonElement element : vectorArray) {
+                vector.add(element.getAsFloat());
+            }
+            
+            logger.debug("成功生成向量，维度: {}", vector.size());
+            return vector;
+            
+        } catch (Exception e) {
+            throw new EmbeddingException("解析响应失败: " + e.getMessage(), e);
+        }
+    }
+}
+```
+
+3.2 MilvusClient.java
+```java
+package com.example.rag.client;
+
+import com.example.rag.config.MilvusConfig;
+import com.example.rag.model.DocumentChunk;
+import com.example.rag.model.SearchResult;
+import io.milvus.client.MilvusServiceClient;
+import io.milvus.grpc.DataType;
+import io.milvus.param.*;
+import io.milvus.param.collection.*;
+import io.milvus.param.dml.InsertParam;
+import io.milvus.param.dml.SearchParam;
+import io.milvus.param.index.CreateIndexParam;
+import io.milvus.response.SearchResultsWrapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class MilvusClient {
+    
+    private static final Logger logger = LoggerFactory.getLogger(MilvusClient.class);
+    
+    private final MilvusConfig milvusConfig;
+    private MilvusServiceClient client;
+    
+    public MilvusClient(MilvusConfig milvusConfig) {
+        this.milvusConfig = milvusConfig;
+    }
+    
+    @PostConstruct
+    public void init() {
+        try {
+            // 连接Milvus
+            ConnectParam connectParam = ConnectParam.newBuilder()
+                    .withHost(milvusConfig.getHost())
+                    .withPort(milvusConfig.getPort())
+                    .withConnectTimeout(10, TimeUnit.SECONDS)
+                    .build();
+            
+            this.client = new MilvusServiceClient(connectParam);
+            logger.info("成功连接到Milvus: {}", milvusConfig.getAddress());
+            
+            // 检查并创建Collection
+            ensureCollectionExists();
+            
+        } catch (Exception e) {
+            logger.error("初始化Milvus客户端失败", e);
+            throw new RuntimeException("Milvus初始化失败", e);
+        }
+    }
+    
+    @PreDestroy
+    public void destroy() {
+        if (client != null) {
+            client.close();
+            logger.info("Milvus客户端已关闭");
+        }
+    }
+    
+    /**
+     * 确保Collection存在
+     */
+    private void ensureCollectionExists() {
+        String collectionName = milvusConfig.getCollectionName();
+        
+        // 检查是否存在
+        R<Boolean> hasResponse = client.hasCollection(
+                HasCollectionParam.newBuilder()
+                        .withCollectionName(collectionName)
+                        .build()
+        );
+        
+        if (hasResponse.getStatus() != 0) {
+            throw new RuntimeException("检查Collection失败: " + hasResponse.getMessage());
+        }
+        
+        if (!hasResponse.getData()) {
+            logger.info("Collection不存在，正在创建: {}", collectionName);
+            createCollection(collectionName);
+            createIndex(collectionName);
+        } else {
+            logger.info("Collection已存在: {}", collectionName);
+        }
+    }
+    
+    /**
+     * 创建Collection
+     */
+    private void createCollection(String collectionName) {
+        // 定义字段
+        FieldType idField = FieldType.newBuilder()
+                .withName("id")
+                .withDataType(DataType.VarChar)
+                .withMaxLength(256)
+                .withPrimaryKey(true)
+                .build();
+        
+        FieldType vectorField = FieldType.newBuilder()
+                .withName("vector")
+                .withDataType(DataType.FloatVector)
+                .withDimension(milvusConfig.getVectorDimension())
+                .build();
+        
+        FieldType contentField = FieldType.newBuilder()
+                .withName("content")
+                .withDataType(DataType.VarChar)
+                .withMaxLength(8192)
+                .build();
+        
+        FieldType metadataField = FieldType.newBuilder()
+                .withName("metadata")
+                .withDataType(DataType.JSON)
+                .build();
+        
+        // 创建Schema
+        CollectionSchemaParam schema = CollectionSchemaParam.newBuilder()
+                .withEnableDynamicField(false)
+                .addFieldType(idField)
+                .addFieldType(vectorField)
+                .addFieldType(contentField)
+                .addFieldType(metadataField)
+                .build();
+        
+        // 创建Collection
+        CreateCollectionParam createParam = CreateCollectionParam.newBuilder()
+                .withCollectionName(collectionName)
+                .withDescription("RAG文档向量集合")
+                .withSchema(schema)
+                .withShardsNum(2)
+                .build();
+        
+        R<RpcStatus> response = client.createCollection(createParam);
+        if (response.getStatus() != 0) {
+            throw new RuntimeException("创建Collection失败: " + response.getMessage());
+        }
+        
+        logger.info("Collection创建成功: {}", collectionName);
+    }
+    
+    /**
+     * 创建索引
+     */
+    private void createIndex(String collectionName) {
+        CreateIndexParam indexParam = CreateIndexParam.newBuilder()
+                .withCollectionName(collectionName)
+                .withFieldName("vector")
+                .withIndexType(IndexType.IVF_FLAT)
+                .withMetricType(MetricType.L2)
+                .withExtraParam("{\"nlist\":" + milvusConfig.getNlist() + "}")
+                .build();
+        
+        R<RpcStatus> response = client.createIndex(indexParam);
+        if (response.getStatus() != 0) {
+            throw new RuntimeException("创建索引失败: " + response.getMessage());
+        }
+        
+        logger.info("索引创建成功");
+    }
+    
+    /**
+     * 插入向量数据
+     */
+    public void insertVector(DocumentChunk chunk, List<Float> vector) {
+        try {
+            // 加载Collection
+            client.loadCollection(
+                    LoadCollectionParam.newBuilder()
+                            .withCollectionName(milvusConfig.getCollectionName())
+                            .build()
+            );
+            
+            // 构建元数据
+            Map<String, Object> metadata = new HashMap<>();
+            metadata.put("sourceFile", chunk.getSourceFile());
+            metadata.put("chunkIndex", chunk.getChunkIndex());
+            if (chunk.getTitle() != null) {
+                metadata.put("title", chunk.getTitle());
+            }
+            
+            // 构建字段数据
+            List<InsertParam.Field> fields = new ArrayList<>();
+            fields.add(new InsertParam.Field("id", 
+                    Collections.singletonList(chunk.getId())));
+            fields.add(new InsertParam.Field("vector", 
+                    Collections.singletonList(vector)));
+            fields.add(new InsertParam.Field("content", 
+                    Collections.singletonList(chunk.getContent())));
+            
+            // 将metadata转为JSON字符串
+            com.google.gson.Gson gson = new com.google.gson.Gson();
+            String metadataJson = gson.toJson(metadata);
+            fields.add(new InsertParam.Field("metadata", 
+                    Collections.singletonList(metadataJson)));
+            
+            // 插入数据
+            InsertParam insertParam = InsertParam.newBuilder()
+                    .withCollectionName(milvusConfig.getCollectionName())
+                    .withFields(fields)
+                    .build();
+            
+            R<MutationResult> response = client.insert(insertParam);
+            if (response.getStatus() != 0) {
+                throw new RuntimeException("插入数据失败: " + response.getMessage());
+            }
+            
+            logger.debug("向量插入成功: id={}", chunk.getId());
+            
+        } catch (Exception e) {
+            logger.error("插入向量失败", e);
+            throw new RuntimeException("插入向量失败", e);
+        }
+    }
+    
+    /**
+     * 搜索相似向量
+     */
+    public List<SearchResult> searchSimilarVectors(List<Float> queryVector, int topK) {
+        try {
+            // 加载Collection
+            client.loadCollection(
+                    LoadCollectionParam.newBuilder()
+                            .withCollectionName(milvusConfig.getCollectionName())
+                            .build()
+            );
+            
+            // 构建搜索参数
+            SearchParam searchParam = SearchParam.newBuilder()
+                    .withCollectionName(milvusConfig.getCollectionName())
+                    .withVectorFieldName("vector")
+                    .withVectors(Collections.singletonList(queryVector))
+                    .withTopK(topK)
+                    .withMetricType(MetricType.L2)
+                    .withOutFields(Arrays.asList("id", "content", "metadata"))
+                    .withParams("{\"nprobe\":10}")
+                    .build();
+            
+            // 执行搜索
+            R<SearchResults> response = client.search(searchParam);
+            if (response.getStatus() != 0) {
+                throw new RuntimeException("搜索失败: " + response.getMessage());
+            }
+            
+            // 解析结果
+            SearchResultsWrapper wrapper = new SearchResultsWrapper(
+                    response.getData().getResults()
+            );
+            
+            List<SearchResult> results = new ArrayList<>();
+            com.google.gson.Gson gson = new com.google.gson.Gson();
+            
+            for (int i = 0; i < wrapper.getRowRecords(0).size(); i++) {
+                String id = (String) wrapper.getIDScore(0).get(i).get("id");
+                String content = (String) wrapper.getFieldData("content", 0).get(i);
+                float score = wrapper.getIDScore(0).get(i).getScore();
+                String metadataStr = (String) wrapper.getFieldData("metadata", 0).get(i);
+                
+                // 解析元数据
+                Map<String, Object> metadata = gson.fromJson(metadataStr, Map.class);
+                
+                SearchResult result = new SearchResult(
+                        id, content, score, 
+                        (String) metadata.get("sourceFile"),
+                        metadata
+                );
+                results.add(result);
+            }
+            
+            logger.info("搜索完成，找到{}个结果", results.size());
+            return results;
+            
+        } catch (Exception e) {
+            logger.error("搜索向量失败", e);
+            throw new RuntimeException("搜索向量失败", e);
+        }
+    }
+    
+    /**
+     * 删除指定文件的所有向量
+     */
+    public void deleteBySourceFile(String sourceFile) {
+        try {
+            client.loadCollection(
+                    LoadCollectionParam.newBuilder()
+                            .withCollectionName(milvusConfig.getCollectionName())
+                            .build()
+            );
+            
+            // 构建删除表达式
+            String expr = String.format("metadata[\"sourceFile\"] == \"%s\"", sourceFile);
+            
+            DeleteParam deleteParam = DeleteParam.newBuilder()
+                    .withCollectionName(milvusConfig.getCollectionName())
+                    .withExpr(expr)
+                    .build();
+            
+            R<MutationResult> response = client.delete(deleteParam);
+            if (response.getStatus() != 0) {
+                logger.warn("删除数据警告: {}", response.getMessage());
+            } else {
+                logger.info("删除文件向量成功: {}, 删除{}条记录", 
+                        sourceFile, response.getData().getDeleteCnt());
+            }
+            
+        } catch (Exception e) {
+            logger.warn("删除文件向量失败（可能不存在）: {}", e.getMessage());
+        }
+    }
+}
+```
+
+
+【4】服务层 (service/)
+----------------------
+
+4.1 FileUploadService.java
+```java
+package com.example.rag.service;
+
+import com.example.rag.config.RagConfig;
+import com.example.rag.model.UploadResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.List;
+
+@Service
+public class FileUploadService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(FileUploadService.class);
+    
+    private final RagConfig ragConfig;
+    
+    public FileUploadService(RagConfig ragConfig) {
+        this.ragConfig = ragConfig;
+    }
+    
+    /**
+     * 保存上传的文件
+     */
+    public UploadResult saveFile(MultipartFile file) {
+        try {
+            // 1. 校验文件
+            validateFile(file);
+            
+            // 2. 创建上传目录
+            Path uploadDir = Paths.get(ragConfig.getUploadDir()).normalize();
+            if (!Files.exists(uploadDir)) {
+                Files.createDirectories(uploadDir);
+            }
+            
+            // 3. 保存文件
+            String originalFilename = file.getOriginalFilename();
+            Path filePath = uploadDir.resolve(originalFilename).normalize();
+            
+            // 如果文件已存在，先删除
+            if (Files.exists(filePath)) {
+                logger.info("文件已存在，将覆盖: {}", filePath);
+                Files.delete(filePath);
+            }
+            
+            Files.copy(file.getInputStream(), filePath);
+            
+            logger.info("文件上传成功: {}", filePath);
+            
+            return UploadResult.success(
+                    originalFilename,
+                    filePath.toString(),
+                    file.getSize(),
+                    0  // 分片数量由后续步骤填充
+            );
+            
+        } catch (IOException e) {
+            logger.error("文件上传失败", e);
+            return UploadResult.failure(
+                    file.getOriginalFilename(),
+                    Arrays.asList("文件上传失败: " + e.getMessage())
+            );
+        }
+    }
+    
+    /**
+     * 校验文件
+     */
+    private void validateFile(MultipartFile file) {
+        if (file.isEmpty()) {
+            throw new IllegalArgumentException("文件不能为空");
+        }
+        
+        String filename = file.getOriginalFilename();
+        if (filename == null || filename.isEmpty()) {
+            throw new IllegalArgumentException("文件名不能为空");
+        }
+        
+        // 检查扩展名
+        String extension = getFileExtension(filename);
+        List<String> allowedExts = Arrays.asList(
+                ragConfig.getAllowedExtensions().split(",")
+        );
+        
+        if (!allowedExts.contains(extension.toLowerCase())) {
+            throw new IllegalArgumentException(
+                    "不支持的文件格式: " + extension + 
+                    "，仅支持: " + ragConfig.getAllowedExtensions()
+            );
+        }
+    }
+    
+    private String getFileExtension(String filename) {
+        int lastIndexOf = filename.lastIndexOf(".");
+        if (lastIndexOf == -1) {
+            return "";
+        }
+        return filename.substring(lastIndexOf + 1).toLowerCase();
+    }
+}
+```
+
+4.2 DocumentChunkService.java
+```java
+package com.example.rag.service;
+
+import com.example.rag.config.RagConfig;
+import com.example.rag.model.DocumentChunk;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Service
+public class DocumentChunkService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(DocumentChunkService.class);
+    
+    private final RagConfig ragConfig;
+    
+    public DocumentChunkService(RagConfig ragConfig) {
+        this.ragConfig = ragConfig;
+    }
+    
+    /**
+     * 智能分片文档
+     */
+    public List<DocumentChunk> chunkDocument(String content, String sourceFile) {
+        List<DocumentChunk> chunks = new ArrayList<>();
+        
+        if (content == null || content.trim().isEmpty()) {
+            logger.warn("文档内容为空: {}", sourceFile);
+            return chunks;
+        }
+        
+        // 1. 按标题分割
+        List<Section> sections = splitByHeadings(content);
+        
+        // 2. 对每个章节进一步分片
+        int globalChunkIndex = 0;
+        for (Section section : sections) {
+            List<DocumentChunk> sectionChunks = chunkSection(section, sourceFile, globalChunkIndex);
+            chunks.addAll(sectionChunks);
+            globalChunkIndex += sectionChunks.size();
+        }
+        
+        logger.info("文档分片完成: {} -> {} 个分片", sourceFile, chunks.size());
+        return chunks;
+    }
+    
+    /**
+     * 按Markdown标题分割
+     */
+    private List<Section> splitByHeadings(String content) {
+        List<Section> sections = new ArrayList<>();
+        
+        Pattern headingPattern = Pattern.compile("^(#{1,6})\\s+(.+)$", Pattern.MULTILINE);
+        Matcher matcher = headingPattern.matcher(content);
+        
+        int lastEnd = 0;
+        String currentTitle = null;
+        
+        while (matcher.find()) {
+            if (lastEnd < matcher.start()) {
+                String sectionContent = content.substring(lastEnd, matcher.start()).trim();
+                if (!sectionContent.isEmpty()) {
+                    sections.add(new Section(currentTitle, sectionContent, lastEnd));
+                }
+            }
+            currentTitle = matcher.group(2).trim();
+            lastEnd = matcher.start();
+        }
+        
+        // 添加最后一个章节
+        if (lastEnd < content.length()) {
+            String sectionContent = content.substring(lastEnd).trim();
+            if (!sectionContent.isEmpty()) {
+                sections.add(new Section(currentTitle, sectionContent, lastEnd));
+            }
+        }
+        
+        // 如果没有标题，整个文档作为一个章节
+        if (sections.isEmpty()) {
+            sections.add(new Section(null, content, 0));
+        }
+        
+        return sections;
+    }
+    
+    /**
+     * 对章节进行分片
+     */
+    private List<DocumentChunk> chunkSection(Section section, String sourceFile, 
+                                            int startChunkIndex) {
+        List<DocumentChunk> chunks = new ArrayList<>();
+        String content = section.content;
+        String title = section.title;
+        
+        // 如果章节内容小于最大尺寸，直接作为一个分片
+        if (content.length() <= ragConfig.getChunkMaxSize()) {
+            DocumentChunk chunk = new DocumentChunk(content, sourceFile, startChunkIndex);
+            chunk.setTitle(title);
+            chunks.add(chunk);
+            return chunks;
+        }
+        
+        // 按段落分割
+        List<String> paragraphs = splitByParagraphs(content);
+        
+        StringBuilder currentChunk = new StringBuilder();
+        int chunkIndex = startChunkIndex;
+        
+        for (String paragraph : paragraphs) {
+            if (currentChunk.length() > 0 && 
+                currentChunk.length() + paragraph.length() > ragConfig.getChunkMaxSize()) {
+                
+                // 保存当前分片
+                String chunkContent = currentChunk.toString().trim();
+                DocumentChunk chunk = new DocumentChunk(chunkContent, sourceFile, chunkIndex++);
+                chunk.setTitle(title);
+                chunks.add(chunk);
+                
+                // 开始新分片，包含重叠
+                String overlap = getOverlapText(chunkContent);
+                currentChunk = new StringBuilder(overlap);
+            }
+            
+            currentChunk.append(paragraph).append("\n\n");
+        }
+        
+        // 保存最后一个分片
+        if (currentChunk.length() > 0) {
+            String chunkContent = currentChunk.toString().trim();
+            DocumentChunk chunk = new DocumentChunk(chunkContent, sourceFile, chunkIndex);
+            chunk.setTitle(title);
+            chunks.add(chunk);
+        }
+        
+        return chunks;
+    }
+    
+    /**
+     * 按段落分割
+     */
+    private List<String> splitByParagraphs(String content) {
+        List<String> paragraphs = new ArrayList<>();
+        String[] parts = content.split("\n\n+");
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                paragraphs.add(trimmed);
+            }
+        }
+        return paragraphs;
+    }
+    
+    /**
+     * 获取重叠文本
+     */
+    private String getOverlapText(String text) {
+        int overlapSize = Math.min(ragConfig.getChunkOverlap(), text.length());
+        if (overlapSize <= 0) {
+            return "";
+        }
+        
+        String overlap = text.substring(text.length() - overlapSize);
+        
+        // 尝试在句子边界截断
+        int lastSentenceEnd = Math.max(
+                overlap.lastIndexOf('。'),
+                Math.max(overlap.lastIndexOf('？'), overlap.lastIndexOf('！'))
+        );
+        
+        if (lastSentenceEnd > overlapSize / 2) {
+            return overlap.substring(lastSentenceEnd + 1).trim();
+        }
+        
+        return overlap.trim();
+    }
+    
+    /**
+     * 章节数据类
+     */
+    private static class Section {
+        String title;
+        String content;
+        int startIndex;
+        
+        Section(String title, String content, int startIndex) {
+            this.title = title;
+            this.content = content;
+            this.startIndex = startIndex;
+        }
+    }
+}
+```
+
+4.3 EmbeddingService.java
+```java
+package com.example.rag.service;
+
+import com.example.rag.client.DashScopeClient;
+import com.example.rag.exception.EmbeddingException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+public class EmbeddingService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(EmbeddingService.class);
+    
+    private final DashScopeClient dashScopeClient;
+    
+    public EmbeddingService(DashScopeClient dashScopeClient) {
+        this.dashScopeClient = dashScopeClient;
+    }
+    
+    /**
+     * 生成文本向量
+     */
+    public List<Float> generateEmbedding(String text) throws EmbeddingException {
+        logger.debug("开始生成向量，文本长度: {}", text.length());
+        List<Float> vector = dashScopeClient.generateEmbedding(text);
+        logger.debug("向量生成成功，维度: {}", vector.size());
+        return vector;
+    }
+    
+    /**
+     * 生成查询向量
+     */
+    public List<Float> generateQueryVector(String query) throws EmbeddingException {
+        return generateEmbedding(query);
+    }
+}
+```
+
+4.4 VectorStoreService.java
+```java
+package com.example.rag.service;
+
+import com.example.rag.client.MilvusClient;
+import com.example.rag.model.DocumentChunk;
+import com.example.rag.model.SearchResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+public class VectorStoreService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(VectorStoreService.class);
+    
+    private final MilvusClient milvusClient;
+    private final EmbeddingService embeddingService;
+    
+    public VectorStoreService(MilvusClient milvusClient, EmbeddingService embeddingService) {
+        this.milvusClient = milvusClient;
+        this.embeddingService = embeddingService;
+    }
+    
+    /**
+     * 存储文档分片的向量
+     */
+    public void storeVector(DocumentChunk chunk) {
+        try {
+            logger.info("开始存储向量: id={}, source={}", chunk.getId(), chunk.getSourceFile());
+            
+            // 1. 生成向量
+            List<Float> vector = embeddingService.generateEmbedding(chunk.getContent());
+            
+            // 2. 存储到Milvus
+            milvusClient.insertVector(chunk, vector);
+            
+            logger.info("向量存储成功: id={}", chunk.getId());
+            
+        } catch (Exception e) {
+            logger.error("存储向量失败: id={}", chunk.getId(), e);
+            throw new RuntimeException("存储向量失败", e);
+        }
+    }
+    
+    /**
+     * 批量存储向量
+     */
+    public void storeVectors(List<DocumentChunk> chunks) {
+        logger.info("开始批量存储向量，数量: {}", chunks.size());
+        
+        for (int i = 0; i < chunks.size(); i++) {
+            DocumentChunk chunk = chunks.get(i);
+            try {
+                storeVector(chunk);
+                logger.info("进度: {}/{}", i + 1, chunks.size());
+            } catch (Exception e) {
+                logger.error("第{}个分片存储失败", i + 1, e);
+                throw e;
+            }
+        }
+        
+        logger.info("批量存储完成");
+    }
+    
+    /**
+     * 搜索相似文档
+     */
+    public List<SearchResult> searchSimilarDocuments(String query, int topK) {
+        try {
+            logger.info("开始搜索相似文档: query={}, topK={}", query, topK);
+            
+            // 1. 生成查询向量
+            List<Float> queryVector = embeddingService.generateQueryVector(query);
+            
+            // 2. 搜索Milvus
+            List<SearchResult> results = milvusClient.searchSimilarVectors(queryVector, topK);
+            
+            logger.info("搜索完成，找到{}个结果", results.size());
+            return results;
+            
+        } catch (Exception e) {
+            logger.error("搜索失败", e);
+            throw new RuntimeException("搜索失败", e);
+        }
+    }
+    
+    /**
+     * 删除文件的向量数据
+     */
+    public void deleteBySourceFile(String sourceFile) {
+        logger.info("删除文件向量: {}", sourceFile);
+        milvusClient.deleteBySourceFile(sourceFile);
+    }
+}
+```
+
+4.5 RetrievalService.java
+```java
+package com.example.rag.service;
+
+import com.example.rag.config.RagConfig;
+import com.example.rag.model.SearchResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class RetrievalService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(RetrievalService.class);
+    
+    private final VectorStoreService vectorStoreService;
+    private final RagConfig ragConfig;
+    
+    public RetrievalService(VectorStoreService vectorStoreService, RagConfig ragConfig) {
+        this.vectorStoreService = vectorStoreService;
+        this.ragConfig = ragConfig;
+    }
+    
+    /**
+     * 检索相关文档
+     */
+    public List<SearchResult> retrieve(String query) {
+        logger.info("开始检索: {}", query);
+        
+        // 1. 搜索相似文档
+        List<SearchResult> results = vectorStoreService.searchSimilarDocuments(
+                query, 
+                ragConfig.getTopK()
+        );
+        
+        // 2. 过滤低相似度结果
+        List<SearchResult> filteredResults = results.stream()
+                .filter(r -> r.getScore() <= ragConfig.getSimilarityThreshold())
+                .collect(Collectors.toList());
+        
+        logger.info("检索完成，返回{}个结果（过滤后）", filteredResults.size());
+        return filteredResults;
+    }
+    
+    /**
+     * 构建上下文
+     */
+    public String buildContext(List<SearchResult> results) {
+        StringBuilder context = new StringBuilder();
+        
+        for (int i = 0; i < results.size(); i++) {
+            SearchResult result = results.get(i);
+            context.append("【参考资料 ").append(i + 1).append("】\n");
+            context.append("来源: ").append(result.getSourceFile()).append("\n");
+            context.append("内容: ").append(result.getContent()).append("\n\n");
+        }
+        
+        return context.toString();
+    }
+}
+```
+
+
+【5】控制器层 (controller/)
+----------------------------
+
+5.1 RagController.java
+```java
+package com.example.rag.controller;
+
+import com.example.rag.model.SearchResult;
+import com.example.rag.model.UploadResult;
+import com.example.rag.service.FileUploadService;
+import com.example.rag.service.RetrievalService;
+import com.example.rag.service.VectorStoreService;
+import com.example.rag.service.DocumentChunkService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/rag")
+public class RagController {
+    
+    private final FileUploadService fileUploadService;
+    private final DocumentChunkService documentChunkService;
+    private final VectorStoreService vectorStoreService;
+    private final RetrievalService retrievalService;
+    
+    public RagController(FileUploadService fileUploadService,
+                        DocumentChunkService documentChunkService,
+                        VectorStoreService vectorStoreService,
+                        RetrievalService retrievalService) {
+        this.fileUploadService = fileUploadService;
+        this.documentChunkService = documentChunkService;
+        this.vectorStoreService = vectorStoreService;
+        this.retrievalService = retrievalService;
+    }
+    
+    /**
+     * 文件上传接口
+     */
+    @PostMapping(value = "/upload", consumes = "multipart/form-data")
+    public ResponseEntity<Map<String, Object>> upload(@RequestParam("file") MultipartFile file) {
+        Map<String, Object> response = new HashMap<>();
+        
+        try {
+            // 1. 保存文件
+            UploadResult uploadResult = fileUploadService.saveFile(file);
+            
+            if (!uploadResult.isSuccess()) {
+                response.put("success", false);
+                response.put("errors", uploadResult.getErrors());
+                return ResponseEntity.badRequest().body(response);
+            }
+            
+            // 2. 读取文件内容
+            String content = Files.readString(Paths.get(uploadResult.getFilePath()));
+            
+            // 3. 删除旧向量数据（去重）
+            vectorStoreService.deleteBySourceFile(uploadResult.getFilePath());
+            
+            // 4. 文档分片
+            List<DocumentChunk> chunks = documentChunkService.chunkDocument(
+                    content, 
+                    uploadResult.getFilePath()
+            );
+            
+            // 5. 存储向量
+            vectorStoreService.storeVectors(chunks);
+            
+            // 6. 更新上传结果
+            uploadResult.setChunkCount(chunks.size());
+            
+            response.put("success", true);
+            response.put("data", uploadResult);
+            return ResponseEntity.ok(response);
+            
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+    
+    /**
+     * 语义检索接口
+     */
+    @GetMapping("/search")
+    public ResponseEntity<Map<String, Object>> search(@RequestParam("q") String query) {
+        Map<String, Object> response = new HashMap<>();
+        
+        try {
+            if (query == null || query.trim().isEmpty()) {
+                response.put("success", false);
+                response.put("error", "查询词不能为空");
+                return ResponseEntity.badRequest().body(response);
+            }
+            
+            // 检索相关文档
+            List<SearchResult> results = retrievalService.retrieve(query);
+            
+            // 构建上下文
+            String context = retrievalService.buildContext(results);
+            
+            response.put("success", true);
+            response.put("results", results);
+            response.put("context", context);
+            response.put("count", results.size());
+            return ResponseEntity.ok(response);
+            
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+}
+```
+
+
+【6】异常类 (exception/)
+------------------------
+
+6.1 RagException.java
+```java
+package com.example.rag.exception;
+
+public class RagException extends RuntimeException {
+    public RagException(String message) {
+        super(message);
+    }
+    
+    public RagException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}
+```
+
+6.2 EmbeddingException.java
+```java
+package com.example.rag.exception;
+
+public class EmbeddingException extends RagException {
+    public EmbeddingException(String message) {
+        super(message);
+    }
+    
+    public EmbeddingException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}
+```
+
+
+四、配置文件 (application.yml)
+===============================
+
+```yaml
+# RAG配置
+rag:
+  api-key: ${DASHSCOPE_API_KEY}
+  embedding-model: text-embedding-v2
+  chunk-max-size: 800
+  chunk-overlap: 100
+  top-k: 3
+  similarity-threshold: 0.8
+  upload-dir: ./uploads
+  allowed-extensions: txt,md
+
+# Milvus配置
+milvus:
+  host: localhost
+  port: 19530
+  collection-name: rag_docs
+  vector-dimension: 1024
+  index-type: IVF_FLAT
+  metric-type: L2
+  nlist: 128
+
+# Spring配置
+spring:
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+```
+
+
+五、Maven依赖 (pom.xml)
+========================
+
+```xml
+<dependencies>
+    <!-- Spring Boot -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    
+    <!-- Milvus -->
+    <dependency>
+        <groupId>io.milvus</groupId>
+        <artifactId>milvus-sdk-java</artifactId>
+        <version>2.3.0</version>
+    </dependency>
+    
+    <!-- OkHttp -->
+    <dependency>
+        <groupId>com.squareup.okhttp3</groupId>
+        <artifactId>okhttp</artifactId>
+        <version>4.12.0</version>
+    </dependency>
+    
+    <!-- Gson -->
+    <dependency>
+        <groupId>com.google.code.gson</groupId>
+        <artifactId>gson</artifactId>
+        <version>2.10.1</version>
+    </dependency>
+    
+    <!-- Lombok -->
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+
+六、使用示例
+============
+
+1. 上传文件:
+```bash
+curl -X POST http://localhost:8080/api/rag/upload \
+  -F "file=@document.md"
+```
+
+2. 语义检索:
+```bash
+curl "http://localhost:8080/api/rag/search?q=如何排查CPU高占用问题"
+```
+
+3. Java代码调用:
+```java
+@Autowired
+private RetrievalService retrievalService;
+
+public String answerQuestion(String question) {
+    // 检索相关文档
+    List<SearchResult> results = retrievalService.retrieve(question);
+    
+    // 构建上下文
+    String context = retrievalService.buildContext(results);
+    
+    // 调用LLM生成答案
+    String prompt = "基于以下资料回答问题:\n" + context + "\n问题: " + question;
+    String answer = llmClient.generate(prompt);
+    
+    return answer;
+}
+```
+
+
+七、关键设计要点
+================
+
+1. 分层清晰: Controller → Service → Client
+2. 配置外置: 所有参数通过配置文件管理
+3. 异常处理: 自定义异常体系，统一错误处理
+4. 日志完善: 关键步骤都有日志记录
+5. 资源管理: Milvus连接自动关闭
+6. 去重机制: 上传前删除旧向量
+7. 智能分片: 保持语义完整性
+8. 相似度过滤: 只返回高质量结果
+
+
+八、扩展方向
+============
+
+1. 支持PDF解析（Apache PDFBox）
+2. 异步批量索引（@Async）
+3. 缓存热门查询（Redis）
+4. 多路召回（关键词+向量）
+5. 重排序模型（Cross-Encoder）
+6. 对话历史管理
+7. 引用溯源（标注答案来源）
+8. 性能监控（Prometheus指标）

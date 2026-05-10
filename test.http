@@ -1,0 +1,7 @@
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{
+  "Id": "1111",
+  "Question": "你好，我是谁"
+}

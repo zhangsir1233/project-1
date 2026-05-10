@@ -1,0 +1,587 @@
+SuperBizAgent 项目文件功能总览
+================================
+
+生成时间: 2026-05-05
+项目名称: SuperBizAgent - AI智能运维助手
+技术栈: Spring Boot + Spring AI + Milvus + DashScope
+
+
+一、项目结构概览
+================
+
+SuperBizAgent/
+├── src/main/java/org/example/
+│   ├── Main.java                          # 应用启动入口
+│   ├── agent/tool/                        # Agent工具层（4个工具类）
+│   ├── client/                            # 客户端层（Milvus客户端工厂）
+│   ├── config/                            # 配置层（7个配置类）
+│   ├── constant/                          # 常量层（1个常量类）
+│   ├── controller/                        # 控制器层（3个控制器）
+│   ├── dto/                               # 数据传输对象（3个DTO）
+│   ├── service/                           # 服务层（7个服务类）
+│   └── tool/                              # 工具类（1个集合删除工具）
+├── src/main/resources/
+│   ├── static/                            # 前端静态资源
+│   └── application.yml                    # 应用配置文件
+├── aiops-docs/                            # AIOps文档目录
+├── uploads/                               # 文件上传目录
+└── volumes/                               # Docker数据卷
+
+
+二、核心功能模块
+================
+
+【模块1】智能对话系统
+---------------------
+相关文件:
+- ChatController.java          # 对话接口控制器
+- ChatService.java             # 对话业务逻辑
+- ReactAgent (Spring AI)       # ReAct模式智能体
+
+功能说明:
+提供基于ReactAgent的智能对话能力，支持多轮对话、会话管理、流式输出。
+Agent可自动调用工具获取时间、查询内部文档、检索Prometheus告警、查询日志等。
+
+API接口:
+- POST /api/chat              # 普通对话（JSON响应）
+- POST /api/chat_stream       # 流式对话（SSE）
+- POST /api/chat/clear        # 清空会话历史
+- GET  /api/chat/session/{id} # 获取会话信息
+
+
+【模块2】AI智能运维系统
+-----------------------
+相关文件:
+- ChatController.java          # AIOps接口入口
+- AiOpsService.java            # 多Agent协作编排
+- SupervisorAgent              # 监督者Agent
+- PlannerAgent                 # 规划者Agent
+- ExecutorAgent                # 执行者Agent
+
+功能说明:
+自动化告警分析流程，通过多Agent协作完成：
+1. 读取活动告警
+2. 拆解排查任务
+3. 执行诊断步骤（查询日志、指标、文档）
+4. 生成结构化运维报告
+
+API接口:
+- POST /api/ai_ops            # 启动AIOps分析流程（SSE流式输出）
+
+
+【模块3】RAG知识库系统
+----------------------
+相关文件:
+- VectorIndexService.java      # 向量索引服务
+- VectorSearchService.java     # 向量搜索服务
+- VectorEmbeddingService.java  # 向量嵌入服务
+- DocumentChunkService.java    # 文档分片服务
+- RagService.java              # RAG问答服务
+- InternalDocsTools.java       # 内部文档查询工具
+
+功能说明:
+实现Retrieval-Augmented Generation架构：
+1. 文件上传 → 智能分片 → 向量化 → 存储到Milvus
+2. 用户提问 → 向量检索 → LLM生成答案
+
+API接口:
+- POST /api/upload            # 文件上传并自动建立索引
+
+
+【模块4】向量数据库管理
+-----------------------
+相关文件:
+- MilvusClientFactory.java     # Milvus客户端工厂
+- MilvusConfig.java            # Milvus配置类
+- MilvusProperties.java        # Milvus属性配置
+- MilvusConstants.java         # Milvus常量定义
+
+功能说明:
+管理Milvus向量数据库连接和Collection：
+- 自动创建Collection（biz）
+- 定义Schema（id, vector, content, metadata）
+- 创建IVF_FLAT索引
+- 连接池管理和资源清理
+
+
+【模块5】Agent工具集
+--------------------
+相关文件:
+- DateTimeTools.java           # 时间查询工具
+- InternalDocsTools.java       # 内部文档查询工具
+- QueryMetricsTools.java       # Prometheus告警查询工具
+- QueryLogsTools.java          # 日志查询工具
+
+功能说明:
+为ReactAgent提供可调用的工具方法：
+1. getCurrentDateTime() - 获取当前时间
+2. queryInternalDocs(query) - 从Milvus检索相关文档
+3. queryPrometheusAlerts() - 查询活动告警
+4. queryLogs(region, topic, query) - 查询云日志（支持Mock）
+
+
+三、文件详细说明
+================
+
+【入口层】
+----------
+1. Main.java
+   功能: Spring Boot应用启动类
+   注解: @SpringBootApplication
+   作用: 自动扫描组件、启动内嵌Tomcat、初始化Spring容器
+
+
+【控制器层】
+------------
+2. ChatController.java
+   功能: 统一API控制器，处理所有对话和AIOps请求
+   路径: /api/*
+   核心方法:
+   - chat() - 普通对话
+   - chatStream() - 流式对话
+   - aiOps() - AIOps分析
+   - clearChatHistory() - 清空会话
+   - getSessionInfo() - 获取会话信息
+   特性: SSE流式输出、会话管理、线程安全
+
+3. FileUploadController.java
+   功能: 文件上传控制器
+   路径: /api/upload
+   核心方法: upload()
+   特性: 
+   - 文件格式校验
+   - 自动触发向量索引
+   - 文件去重（同名覆盖）
+
+4. MilvusCheckController.java
+   功能: Milvus健康检查
+   路径: /milvus/health
+   核心方法: simpleHealth()
+   作用: 测试Milvus连接状态
+
+
+【服务层】
+----------
+5. ChatService.java
+   功能: 聊天服务，封装ReactAgent创建和对话逻辑
+   核心方法:
+   - createDashScopeApi() - 创建DashScope API实例
+   - createStandardChatModel() - 创建标准聊天模型
+   - buildSystemPrompt() - 构建系统提示词（含历史消息）
+   - createReactAgent() - 创建ReactAgent
+   - executeChat() - 执行对话
+   依赖: 4个Tool组件、ToolCallbackProvider
+
+6. AiOpsService.java
+   功能: AI运维服务，多Agent协作编排
+   核心方法:
+   - executeAiOpsAnalysis() - 执行AIOps分析流程
+   - extractFinalReport() - 提取最终报告
+   - buildPlannerAgent() - 构建规划者Agent
+   - buildExecutorAgent() - 构建执行者Agent
+   架构: Supervisor → Planner ↔ Executor 循环协作
+
+7. RagService.java
+   功能: RAG问答服务
+   核心方法:
+   - queryStream() - 流式问答（支持历史消息）
+   - buildContext() - 构建上下文
+   - buildPrompt() - 构建提示词
+   - generateAnswerStream() - 流式调用LLM
+   依赖: VectorSearchService、DashScope Generation API
+
+8. VectorIndexService.java
+   功能: 向量索引服务，负责文件→向量→Milvus的全流程
+   核心方法:
+   - indexDirectory() - 索引整个目录
+   - indexSingleFile() - 索引单个文件
+   - deleteExistingData() - 删除旧数据（去重）
+   - insertToMilvus() - 插入向量到Milvus
+   流程: 读取文件 → 分片 → 向量化 → 存储
+
+9. VectorSearchService.java
+   功能: 向量搜索服务
+   核心方法: searchSimilarDocuments()
+   参数: query文本、topK数量
+   返回: SearchResult列表（含相似度分数）
+   依赖: VectorEmbeddingService、MilvusServiceClient
+
+10. VectorEmbeddingService.java
+    功能: 向量嵌入服务，调用DashScope Text Embedding API
+    核心方法:
+    - generateEmbedding() - 生成单个文本向量
+    - generateEmbeddings() - 批量生成向量
+    - generateQueryVector() - 生成查询向量
+    - calculateCosineSimilarity() - 计算余弦相似度
+    模型: 豆包embedding模型（1024维）
+
+11. DocumentChunkService.java
+    功能: 文档分片服务，智能切分长文档
+    核心方法:
+    - chunkDocument() - 智能分片
+    - splitByHeadings() - 按Markdown标题分割
+    - chunkSection() - 章节内部分片
+    - splitByParagraphs() - 按段落分割
+    - getOverlapText() - 提取重叠文本
+    策略: 标题优先 → 段落边界 → 固定大小 + 重叠
+
+
+【工具层】
+----------
+12. DateTimeTools.java
+    功能: 时间查询工具
+    工具名: getCurrentDateTime
+    返回: 当前时区的日期时间字符串
+    用途: Agent需要知道当前时间时使用
+
+13. InternalDocsTools.java
+    功能: 内部文档查询工具
+    工具名: queryInternalDocs
+    参数: query搜索关键词
+    返回: JSON格式的搜索结果（含内容、分数、元数据）
+    依赖: VectorSearchService
+    用途: Agent查询公司内部文档、流程、最佳实践
+
+14. QueryMetricsTools.java
+    功能: Prometheus告警查询工具
+    工具名: queryPrometheusAlerts
+    返回: 活动告警列表（告警名、描述、状态、持续时间）
+    模式: 
+    - Mock模式: 返回预定义告警（HighCPUUsage等）
+    - 真实模式: 调用Prometheus API
+    用途: Agent分析系统告警状态
+
+15. QueryLogsTools.java
+    功能: 云日志查询工具
+    工具名: 
+    - getAvailableLogTopics() - 获取日志主题列表
+    - queryLogs() - 查询日志
+    参数: region、logTopic、query、limit
+    返回: JSON格式日志列表
+    模式:
+    - Mock模式: 根据告警类型返回关联日志
+    - 真实模式: 预留CLS API接口（未实现）
+    日志主题:
+    - system-metrics（系统指标）
+    - application-logs（应用日志）
+    - database-slow-query（慢查询）
+    - system-events（系统事件）
+
+
+【配置层】
+----------
+16. MilvusConfig.java
+    功能: Milvus配置类，创建MilvusServiceClient Bean
+    生命周期: 
+    - @Bean创建客户端
+    - @PreDestroy关闭连接
+    依赖: MilvusClientFactory
+
+17. MilvusProperties.java
+    功能: Milvus属性配置
+    配置前缀: milvus
+    属性: host、port、username、password、database、timeout
+    方法: getAddress() - 拼接host:port
+
+18. WebConfig.java
+    功能: Web MVC配置，解决中文乱码
+    配置:
+    - StringHttpMessageConverter (UTF-8)
+    - MappingJackson2HttpMessageConverter (UTF-8)
+    - ObjectMapper Bean
+
+19. DashScopeConfig.java
+    功能: DashScope API配置
+    配置: RestClient超时时间（默认180秒）
+    实现: 自定义OkHttpClient设置connect/read/write/call timeout
+
+20. DocumentChunkConfig.java
+    功能: 文档分片配置
+    配置前缀: document.chunk
+    属性:
+    - maxSize: 每个分片最大字符数（默认800）
+    - overlap: 分片重叠字符数（默认100）
+
+21. FileUploadConfig.java
+    功能: 文件上传配置
+    配置前缀: file.upload
+    属性:
+    - path: 上传文件保存路径
+    - allowedExtensions: 允许的文件扩展名（逗号分隔）
+
+22. WebMvcConfig.java
+    功能: Web MVC额外配置（如存在）
+
+
+【客户端层】
+------------
+23. MilvusClientFactory.java
+    功能: Milvus客户端工厂
+    核心方法: createClient()
+    流程:
+    1. 连接到Milvus服务器
+    2. 检查Collection是否存在
+    3. 不存在则创建Collection（biz）
+    4. 创建IVF_FLAT索引
+    Schema:
+    - id: VarChar(256), 主键
+    - vector: FloatVector(1024)
+    - content: VarChar(8192)
+    - metadata: JSON
+    依赖: MilvusProperties、MilvusConstants
+
+
+【常量层】
+----------
+24. MilvusConstants.java
+    功能: Milvus常量定义
+    常量:
+    - MILVUS_DB_NAME: "default"
+    - MILVUS_COLLECTION_NAME: "biz"
+    - VECTOR_DIM: 1024（豆包模型维度）
+    - ID_MAX_LENGTH: 256
+    - CONTENT_MAX_LENGTH: 8192
+    - DEFAULT_SHARD_NUMBER: 2
+
+
+【DTO层】
+---------
+25. DocumentChunk.java
+    功能: 文档分片数据对象
+    属性:
+    - content: 分片内容
+    - startIndex: 起始位置
+    - endIndex: 结束位置
+    - chunkIndex: 分片序号
+    - title: 分片标题
+    构造器: 无参、全参
+
+26. FileUploadRes.java
+    功能: 文件上传响应对象
+    属性:
+    - fileName: 文件名
+    - filePath: 文件路径
+    - fileSize: 文件大小
+
+27. AIOpsRequest.java
+    功能: AIOps请求对象（如存在）
+
+
+【其他工具】
+------------
+28. DropCollection.java
+    功能: 删除Milvus Collection工具（用于测试或维护）
+
+
+四、数据流向图
+==============
+
+【对话流程】
+用户提问 
+  → ChatController.chat()/chatStream()
+  → ChatService.createReactAgent()
+  → ReactAgent.call()/stream()
+  → [自动工具调用]
+     ├─ DateTimeTools.getCurrentDateTime()
+     ├─ InternalDocsTools.queryInternalDocs()
+     │   → VectorSearchService.searchSimilarDocuments()
+     │      → VectorEmbeddingService.generateQueryVector()
+     │      → MilvusServiceClient.search()
+     ├─ QueryMetricsTools.queryPrometheusAlerts()
+     └─ QueryLogsTools.queryLogs()
+  → DashScope ChatModel生成答案
+  → 返回给用户（JSON或SSE）
+
+【文件上传流程】
+用户上传文件
+  → FileUploadController.upload()
+  → 保存到uploads/目录
+  → VectorIndexService.indexSingleFile()
+     → 读取文件内容
+     → 删除旧数据（去重）
+     → DocumentChunkService.chunkDocument()
+        → 按标题分割
+        → 按段落分割
+        → 添加重叠
+     → [对每个分片]
+        → VectorEmbeddingService.generateEmbedding()
+           → DashScope TextEmbedding API
+        → VectorIndexService.insertToMilvus()
+           → MilvusServiceClient.insert()
+  → 返回上传结果
+
+【AIOps流程】
+触发AIOps
+  → ChatController.aiOps()
+  → AiOpsService.executeAiOpsAnalysis()
+  → SupervisorAgent.invoke()
+  → [循环协作]
+     ├─ PlannerAgent规划步骤
+     │   → 调用工具获取信息
+     ├─ ExecutorAgent执行第一步
+     │   → 调用工具收集证据
+     └─ Supervisor评估是否继续
+  → decision=FINISH
+  → AiOpsService.extractFinalReport()
+  → 输出告警分析报告（SSE流式）
+
+
+五、关键技术点
+==============
+
+1. ReactAgent智能体
+   - ReAct模式：Reasoning + Acting
+   - 自动规划→执行→再规划闭环
+   - 支持流式输出和工具调用
+
+2. 多Agent协作
+   - Supervisor: 调度决策
+   - Planner: 任务拆解和规划
+   - Executor: 具体步骤执行
+   - 通过state共享数据（planner_plan、executor_feedback）
+
+3. RAG架构
+   - 向量检索：Milvus L2距离搜索
+   - 语义理解：DashScope embedding模型
+   - 智能分片：保持语义完整性
+   - 上下文增强：历史消息+检索文档
+
+4. 会话管理
+   - ConcurrentHashMap存储会话
+   - ReentrantLock保证线程安全
+   - 滑动窗口：最多保留6对消息
+   - UUID生成会话ID
+
+5. SSE流式输出
+   - SseEmitter异步推送
+   - ExecutorService线程池处理
+   - 实时反馈Agent思考过程
+   - 支持错误处理和超时控制
+
+6. Mock支持
+   - QueryMetricsTools: 模拟Prometheus告警
+   - QueryLogsTools: 模拟云日志数据
+   - 通过配置开关切换Mock/真实模式
+   - 便于开发测试
+
+7. 向量数据库
+   - Milvus分布式向量数据库
+   - IVF_FLAT索引（nlist=128）
+   - L2距离度量（欧氏距离）
+   - 自动创建Collection和索引
+
+8. 文件去重
+   - 基于文件名识别重复
+   - 上传前先删除旧向量数据
+   - 使用metadata._source字段过滤
+   - 路径标准化（统一正斜杠）
+
+
+六、配置项汇总
+==============
+
+application.yml关键配置:
+
+spring:
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY}
+      chat:
+        options:
+          timeout: 180000
+
+dashscope:
+  api:
+    key: ${DASHSCOPE_API_KEY}
+  embedding:
+    model: text-embedding-v2
+
+rag:
+  top-k: 3
+  model: qwen3-30b-a3b-thinking-2507
+
+prometheus:
+  base-url: http://localhost:9090
+  mock-enabled: true
+  timeout: 10
+
+cls:
+  mock-enabled: true
+
+file:
+  upload:
+    path: ./uploads
+    allowed-extensions: txt,md
+
+document:
+  chunk:
+    max-size: 800
+    overlap: 100
+
+milvus:
+  host: localhost
+  port: 19530
+  username: ""
+  password: ""
+  database: default
+  timeout: 10000
+
+
+七、依赖关系总结
+================
+
+Controller层依赖Service层:
+- ChatController → ChatService, AiOpsService
+- FileUploadController → VectorIndexService
+- MilvusCheckController → MilvusServiceClient
+
+Service层依赖关系:
+- ChatService → 4个Tool组件, ToolCallbackProvider
+- AiOpsService → 4个Tool组件
+- RagService → VectorSearchService
+- VectorIndexService → VectorEmbeddingService, DocumentChunkService, MilvusServiceClient
+- VectorSearchService → VectorEmbeddingService, MilvusServiceClient
+- DocumentChunkService → DocumentChunkConfig
+
+Tool层依赖:
+- InternalDocsTools → VectorSearchService
+- QueryMetricsTools → OkHttpClient (HTTP客户端)
+- QueryLogsTools → 无外部依赖（Mock模式）
+
+配置层依赖:
+- MilvusConfig → MilvusClientFactory
+- MilvusClientFactory → MilvusProperties, MilvusConstants
+
+
+八、项目特色
+============
+
+1. 智能化: ReactAgent自动调用工具，无需硬编码流程
+2. 模块化: 清晰的分层架构，职责分明
+3. 可扩展: 新增工具只需添加@Component即可被Agent发现
+4. 灵活性: Mock/真实模式切换，便于开发和生产
+5. 高性能: SSE流式输出，Milvus向量检索
+6. 易用性: 文件上传自动索引，会话自动管理
+7. 可靠性: 线程安全、异常处理、资源清理
+
+
+九、适用场景
+============
+
+1. 智能客服: 基于知识库的问答系统
+2. AIOps: 自动化运维告警分析
+3. 企业搜索: 内部文档智能检索
+4. 技术支持: 故障诊断和问题排查
+5. 知识管理: 文档向量化存储和检索
+
+
+十、技术栈版本
+==============
+
+- Java: 17+
+- Spring Boot: 3.x
+- Spring AI: Alibaba Cloud AI
+- Milvus: 2.x
+- DashScope: 阿里云通义千问
+- Lombok: 1.18.x
+- OkHttp: 4.x
